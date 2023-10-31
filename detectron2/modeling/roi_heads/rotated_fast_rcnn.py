@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from detectron2.config import configurable
-from detectron2.layers import ShapeSpec, batched_nms_rotated
+from detectron2.layers import ShapeSpec, batched_nms_rotated, batched_soft_nms_rotated
 from detectron2.structures import Instances, RotatedBoxes, pairwise_iou_rotated
 from detectron2.utils.events import get_event_storage
 
@@ -73,16 +73,32 @@ def fast_rcnn_inference_rotated(
     """
     result_per_image = [
         fast_rcnn_inference_single_image_rotated(
-            boxes_per_image, scores_per_image, image_shape, score_thresh, nms_thresh, topk_per_image
+            boxes_per_image,
+            scores_per_image,
+            image_shape,
+            score_thresh,
+            nms_thresh,
+            topk_per_image,
         )
-        for scores_per_image, boxes_per_image, image_shape in zip(scores, boxes, image_shapes)
+        for scores_per_image, boxes_per_image, image_shape in zip(
+            scores, boxes, image_shapes
+        )
     ]
     return [x[0] for x in result_per_image], [x[1] for x in result_per_image]
 
 
 @torch.no_grad()
 def fast_rcnn_inference_single_image_rotated(
-    boxes, scores, image_shape, score_thresh, nms_thresh, topk_per_image
+    boxes,
+    scores,
+    image_shape,
+    score_thresh,
+    nms_thresh,
+    topk_per_image,
+    soft_nms_enabled: bool,
+    soft_nms_method: str,
+    soft_nms_sigma: float,
+    soft_nms_prune: float,
 ):
     """
     Single-image inference. Return rotated bounding-box detection results by thresholding
@@ -119,7 +135,13 @@ def fast_rcnn_inference_single_image_rotated(
     scores = scores[filter_mask]
 
     # Apply per-class Rotated NMS
-    keep = batched_nms_rotated(boxes, scores, filter_inds[:, 1], nms_thresh)
+    if not soft_nms_enabled:
+        keep = batched_nms_rotated(boxes, scores, filter_inds[:, 1], nms_thresh)
+    else:
+        keep, soft_nms_scores = batched_soft_nms_rotated(
+            boxes, scores, filter_inds[:, 1], soft_nms_method, soft_nms_sigma, nms_thresh, soft_nms_prune
+        )
+        scores[keep] = soft_nms_scores
     if topk_per_image >= 0:
         keep = keep[:topk_per_image]
     boxes, scores, filter_inds = boxes[keep], scores[keep], filter_inds[keep]
@@ -181,7 +203,9 @@ class RROIHeads(StandardROIHeads):
         assert (
             not self.mask_on and not self.keypoint_on
         ), "Mask/Keypoints not supported in Rotated ROIHeads."
-        assert not self.train_on_pred_boxes, "train_on_pred_boxes not implemented for RROIHeads!"
+        assert (
+            not self.train_on_pred_boxes
+        ), "train_on_pred_boxes not implemented for RROIHeads!"
 
     @classmethod
     def _init_box_head(cls, cfg, input_shape):
@@ -203,7 +227,10 @@ class RROIHeads(StandardROIHeads):
             pooler_type=pooler_type,
         )
         box_head = build_box_head(
-            cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
+            cfg,
+            ShapeSpec(
+                channels=in_channels, height=pooler_resolution, width=pooler_resolution
+            ),
         )
         # This line is the only difference v.s. StandardROIHeads
         box_predictor = RotatedFastRCNNOutputLayers(cfg, box_head.output_shape)
@@ -257,7 +284,9 @@ class RROIHeads(StandardROIHeads):
 
             if has_gt:
                 sampled_targets = matched_idxs[sampled_idxs]
-                proposals_per_image.gt_boxes = targets_per_image.gt_boxes[sampled_targets]
+                proposals_per_image.gt_boxes = targets_per_image.gt_boxes[
+                    sampled_targets
+                ]
 
             num_bg_samples.append((gt_classes == self.num_classes).sum().item())
             num_fg_samples.append(gt_classes.numel() - num_bg_samples[-1])

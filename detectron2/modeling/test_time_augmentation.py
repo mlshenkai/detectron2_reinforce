@@ -275,6 +275,10 @@ class GeneralizedRCNNWithTTA(nn.Module):
             1e-8,
             self.cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST,
             self.cfg.TEST.DETECTIONS_PER_IMAGE,
+            self.cfg.MODEL.ROI_HEADS.SOFT_NMS_ENABLED,
+            self.cfg.MODEL.ROI_HEADS.SOFT_NMS_METHOD,
+            self.cfg.MODEL.ROI_HEADS.SOFT_NMS_SIGMA,
+            self.cfg.MODEL.ROI_HEADS.SOFT_NMS_PRUNE,
         )
 
         return merged_instances
