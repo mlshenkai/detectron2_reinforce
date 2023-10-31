@@ -8,7 +8,14 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from detectron2.config import configurable
-from detectron2.layers import CycleBatchNormList, ShapeSpec, batched_nms, cat, get_norm
+from detectron2.layers import (
+    CycleBatchNormList,
+    ShapeSpec,
+    batched_nms,
+    cat,
+    get_norm,
+    batched_soft_nms,
+)
 from detectron2.structures import Boxes, ImageList, Instances, pairwise_iou
 from detectron2.utils.events import get_event_storage
 
@@ -54,6 +61,10 @@ class RetinaNet(DenseDetector):
         pixel_std,
         vis_period=0,
         input_format="BGR",
+        soft_nms_enabled=False,
+        soft_nms_method="linear",
+        soft_nms_sigma=0.5,
+        soft_nms_prune=0.001,
     ):
         """
         NOTE: this interface is experimental.
@@ -111,6 +122,10 @@ class RetinaNet(DenseDetector):
         # Vis parameters
         self.vis_period = vis_period
         self.input_format = input_format
+        self.soft_nms_enabled = soft_nms_enabled
+        self.soft_nms_method = soft_nms_method
+        self.soft_nms_sigma = soft_nms_sigma
+        self.soft_nms_prune = soft_nms_prune
 
     @classmethod
     def from_config(cls, cfg):
@@ -123,7 +138,9 @@ class RetinaNet(DenseDetector):
             "backbone": backbone,
             "head": head,
             "anchor_generator": anchor_generator,
-            "box2box_transform": Box2BoxTransform(weights=cfg.MODEL.RETINANET.BBOX_REG_WEIGHTS),
+            "box2box_transform": Box2BoxTransform(
+                weights=cfg.MODEL.RETINANET.BBOX_REG_WEIGHTS
+            ),
             "anchor_matcher": Matcher(
                 cfg.MODEL.RETINANET.IOU_THRESHOLDS,
                 cfg.MODEL.RETINANET.IOU_LABELS,
@@ -143,6 +160,10 @@ class RetinaNet(DenseDetector):
             "test_topk_candidates": cfg.MODEL.RETINANET.TOPK_CANDIDATES_TEST,
             "test_nms_thresh": cfg.MODEL.RETINANET.NMS_THRESH_TEST,
             "max_detections_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
+            "soft_nms_enabled": cfg.MODEL.RETINANET.SOFT_NMS_ENABLED,
+            "soft_nms_method": cfg.MODEL.RETINANET.SOFT_NMS_METHOD,
+            "soft_nms_sigma": cfg.MODEL.RETINANET.SOFT_NMS_SIGMA,
+            "soft_nms_prune": cfg.MODEL.RETINANET.SOFT_NMS_PRUNE,
             # Vis parameters
             "vis_period": cfg.VIS_PERIOD,
             "input_format": cfg.INPUT.FORMAT,
@@ -155,7 +176,9 @@ class RetinaNet(DenseDetector):
         )
         anchors = self.anchor_generator(features)
         gt_labels, gt_boxes = self.label_anchors(anchors, gt_instances)
-        return self.losses(anchors, pred_logits, gt_labels, pred_anchor_deltas, gt_boxes)
+        return self.losses(
+            anchors, pred_logits, gt_labels, pred_anchor_deltas, gt_boxes
+        )
 
     def losses(self, anchors, pred_logits, gt_labels, pred_anchor_deltas, gt_boxes):
         """
@@ -183,7 +206,9 @@ class RetinaNet(DenseDetector):
         normalizer = self._ema_update("loss_normalizer", max(num_pos_anchors, 1), 100)
 
         # classification and regression loss
-        gt_labels_target = F.one_hot(gt_labels[valid_mask], num_classes=self.num_classes + 1)[
+        gt_labels_target = F.one_hot(
+            gt_labels[valid_mask], num_classes=self.num_classes + 1
+        )[
             :, :-1
         ]  # no loss for the last (background) class
         loss_cls = sigmoid_focal_loss_jit(
@@ -302,9 +327,24 @@ class RetinaNet(DenseDetector):
             self.test_topk_candidates,
             image_size,
         )
-        keep = batched_nms(  # per-class NMS
-            pred.pred_boxes.tensor, pred.scores, pred.pred_classes, self.test_nms_thresh
-        )
+        if not self.soft_nms_enabled:
+            keep = batched_nms(  # per-class NMS
+                pred.pred_boxes.tensor,
+                pred.scores,
+                pred.pred_classes,
+                self.test_nms_thresh,
+            )
+        else:
+            keep, soft_nms_scores = batched_soft_nms(
+                pred.pred_boxes.tensor,
+                pred.scores,
+                pred.pred_classes,
+                self.soft_nms_method,
+                self.soft_nms_sigma,
+                self.test_nms_thresh,
+                self.soft_nms_prune,
+            )
+            pred.scores[keep] = soft_nms_scores
         return pred[keep[: self.max_detections_per_image]]
 
 
@@ -387,7 +427,12 @@ class RetinaNetHead(nn.Module):
         )
 
         # Initialization
-        for modules in [self.cls_subnet, self.bbox_subnet, self.cls_score, self.bbox_pred]:
+        for modules in [
+            self.cls_subnet,
+            self.bbox_subnet,
+            self.cls_score,
+            self.bbox_pred,
+        ]:
             for layer in modules.modules():
                 if isinstance(layer, nn.Conv2d):
                     torch.nn.init.normal_(layer.weight, mean=0, std=0.01)
